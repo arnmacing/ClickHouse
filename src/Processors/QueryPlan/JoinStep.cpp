@@ -5,6 +5,7 @@
 #include <Interpreters/TableJoin.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Processors/QueryPlan/JoinStep.h>
+#include <Processors/QueryPlan/Optimizations/RuntimeDataflowStatistics.h>
 #include <Processors/Transforms/JoiningTransform.h>
 #include <Processors/Transforms/SquashingTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
@@ -12,6 +13,7 @@
 #include <Common/typeid_cast.h>
 #include <Core/BlockNameMap.h>
 #include <Processors/Transforms/ColumnPermuteTransform.h>
+#include <Processors/QueryPlan/QueryPlanFormat.h>
 #include <fmt/format.h>
 
 namespace DB
@@ -25,7 +27,7 @@ namespace ErrorCodes
 namespace
 {
 
-std::vector<std::pair<String, String>> describeJoinActions(const JoinPtr & join, bool pretty = false)
+std::vector<std::pair<String, String>> describeJoinActions(const JoinPtr & join, const ExplainFormatSettings & settings)
 {
     std::vector<std::pair<String, String>> description;
     const auto & table_join = join->getTableJoin();
@@ -39,7 +41,7 @@ std::vector<std::pair<String, String>> describeJoinActions(const JoinPtr & join,
     String kind = toString(table_join.kind());
     String strictness = toString(table_join.strictness());
 
-    if (pretty)
+    if (settings.pretty)
     {
         to_lower(kind);
         to_lower(strictness);
@@ -49,12 +51,19 @@ std::vector<std::pair<String, String>> describeJoinActions(const JoinPtr & join,
     description.emplace_back("Strictness", strictness);
     description.emplace_back("Algorithm", join->getName());
 
+    if (const auto join_expression_value = table_join.getJoinExpressionValue())
+        description.emplace_back("Constant expression value", *join_expression_value ? "true" : "false");
+
     if (table_join.strictness() == JoinStrictness::Asof)
         description.emplace_back("ASOF inequality", toString(table_join.getAsofInequality()));
 
-    std::string_view join_conditions_label = pretty ? "Join conditions" : "Clauses";
     if (!table_join.getClauses().empty())
-        description.emplace_back(join_conditions_label, TableJoin::formatClauses(table_join.getClauses(), true /*short_format*/));
+    {
+        if (settings.pretty)
+            description.emplace_back("Join conditions", TableJoin::formatClausesPretty(table_join.getClauses(), settings));
+        else
+            description.emplace_back("Clauses", TableJoin::formatClauses(table_join.getClauses(), true /*short_format*/));
+    }
 
     if (const auto & mixed_expression = table_join.getMixedJoinExpression())
         description.emplace_back("Residual filter", mixed_expression->getSampleBlock().dumpNames());
@@ -118,6 +127,8 @@ JoinStep::JoinStep(
     , use_join_disjunctions_push_down(use_join_disjunctions_push_down_)
     , disjunctions_optimization_applied(false)
 {
+    if (keep_left_read_in_order)
+        join->keepLeftPipelineInOrder();
     updateInputHeaders({left_header_, right_header_});
 }
 
@@ -142,7 +153,7 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
         if (join->pipelineType() == JoinPipelineType::YShaped)
         {
             joined_pipeline = QueryPipelineBuilder::joinPipelinesYShaped(
-                std::move(pipelines[0]), std::move(pipelines[1]), join, join_algorithm_header, max_block_size, &processors);
+                std::move(pipelines[0]), std::move(pipelines[1]), join, join_algorithm_header, max_block_size, this, &processors);
             joined_pipeline->resize(max_streams);
         }
         else
@@ -156,6 +167,7 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
                 min_block_size_rows,
                 min_block_size_bytes,
                 max_streams,
+                this,
                 keep_left_read_in_order,
                 &processors);
         }
@@ -165,7 +177,7 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
         if (join->pipelineType() == JoinPipelineType::YShaped)
         {
             joined_pipeline = QueryPipelineBuilder::joinPipelinesYShapedByShards(
-                std::move(pipelines[0]), std::move(pipelines[1]), join, join_algorithm_header, max_block_size, &processors);
+                std::move(pipelines[0]), std::move(pipelines[1]), join, join_algorithm_header, max_block_size, this, &processors);
         }
         else
         {
@@ -175,6 +187,7 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
                 join,
                 join_algorithm_header,
                 max_block_size,
+                this,
                 &processors);
         }
     }
@@ -182,12 +195,19 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
     if (!use_new_analyzer)
         return joined_pipeline;
 
+    const auto tail_stage = join->pipelineType() == JoinPipelineType::YShaped ? JoinStage::Default : JoinStage::Probe;
+    auto tag_tail = [this, tail_stage](ProcessorPtr processor)
+    {
+        processor->setQueryPlanStep(this, static_cast<size_t>(tail_stage));
+        return processor;
+    };
+
     auto column_permutation = getPermutationForBlock(joined_pipeline->getHeader(), lhs_header, rhs_header, required_output);
     if (!column_permutation.empty())
     {
-        joined_pipeline->addSimpleTransform([&column_permutation](const SharedHeader & header)
+        joined_pipeline->addSimpleTransform([&](const SharedHeader & header)
         {
-            return std::make_shared<ColumnPermuteTransform>(header, column_permutation);
+            return tag_tail(std::make_shared<ColumnPermuteTransform>(header, column_permutation));
         });
     }
 
@@ -195,7 +215,7 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
     {
         joined_pipeline->addSimpleTransform(
             [&](const SharedHeader & header)
-            { return std::make_shared<SimpleSquashingChunksTransform>(header, min_block_size_rows, min_block_size_bytes); });
+            { return tag_tail(std::make_shared<SimpleSquashingChunksTransform>(header, min_block_size_rows, min_block_size_bytes)); });
     }
 
     const auto & pipeline_output_header = joined_pipeline->getHeader();
@@ -204,6 +224,12 @@ QueryPipelineBuilderPtr JoinStep::updatePipeline(QueryPipelineBuilders pipelines
     {
         assertBlocksHaveEqualStructure(pipeline_output_header, *expected_output_header,
             fmt::format("JoinStep: [{}] and [{}]", pipeline_output_header.dumpNames(), expected_output_header->dumpNames()));
+    }
+
+    if (dataflow_cache_updater)
+    {
+        joined_pipeline->addSimpleTransform([&](const SharedHeader & header)
+        { return std::make_shared<RuntimeDataflowStatisticsCollector>(header, dataflow_cache_updater); });
     }
 
     return joined_pipeline;
@@ -222,6 +248,27 @@ void JoinStep::keepLeftPipelineInOrder(bool disable_squashing)
         min_block_size_bytes = 0;
     }
     keep_left_read_in_order = true;
+    join->keepLeftPipelineInOrder();
+}
+
+std::vector<size_t> JoinStep::getStepGroups() const
+{
+    return {
+        static_cast<size_t>(JoinStage::Default),
+        static_cast<size_t>(JoinStage::Probe),
+        static_cast<size_t>(JoinStage::Build)
+    };
+}
+
+String JoinStep::getStepGroupName(size_t group) const
+{
+    switch (static_cast<JoinStage>(group))
+    {
+        case JoinStage::Default: return {};
+        case JoinStage::Probe: return "probe";
+        case JoinStage::Build: return "build";
+    }
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown JoinStageA group {}", group);
 }
 
 void JoinStep::describePipeline(FormatSettings & settings) const
@@ -233,7 +280,7 @@ void JoinStep::describeActions(FormatSettings & settings) const
 {
     const String & prefix = settings.detail_prefix;
 
-    auto description = describeJoinActions(join, settings.pretty);
+    auto description = describeJoinActions(join, settings);
     const size_t inline_count = settings.pretty ? 3 : 0;
 
     if (settings.pretty)
@@ -263,7 +310,6 @@ void JoinStep::describeActions(FormatSettings & settings) const
         const auto & [name, value] = description[i];
         settings.out << prefix << name << ": " << value << '\n';
     }
-
     if (swap_streams)
         settings.out << prefix << "Swapped: true\n";
     if (!primary_key_sharding.empty())
@@ -288,7 +334,10 @@ void JoinStep::describeActions(FormatSettings & settings) const
 
 void JoinStep::describeActions(JSONBuilder::JSONMap & map) const
 {
-    for (const auto & [name, value] : describeJoinActions(join))
+    WriteBufferFromOwnString dummy;
+    ExplainFormatSettings dummy_settings{.out = dummy, .header_prefix = "", .detail_prefix = "", .pretty_names = {}, .runtime_filter_names = {}};
+
+    for (const auto & [name, value] : describeJoinActions(join, dummy_settings))
         map.add(name, value);
     if (swap_streams)
         map.add("Swapped", true);
@@ -311,6 +360,8 @@ void JoinStep::setJoin(JoinPtr join_, bool swap_streams_)
     join_algorithm_header.reset();
     swap_streams = swap_streams_;
     join = std::move(join_);
+    if (keep_left_read_in_order)
+        join->keepLeftPipelineInOrder();
     updateOutputHeader();
 }
 
@@ -400,13 +451,16 @@ void FilledJoinStep::describeActions(FormatSettings & settings) const
 {
     const String & prefix = settings.detail_prefix;
 
-    for (const auto & [name, value] : describeJoinActions(join))
+    for (const auto & [name, value] : describeJoinActions(join, settings))
         settings.out << prefix << name << ": " << value << '\n';
 }
 
 void FilledJoinStep::describeActions(JSONBuilder::JSONMap & map) const
 {
-    for (const auto & [name, value] : describeJoinActions(join))
+    WriteBufferFromOwnString dummy;
+    ExplainFormatSettings dummy_settings{.out = dummy, .header_prefix = "", .detail_prefix = "", .pretty_names = {}, .runtime_filter_names = {}};
+
+    for (const auto & [name, value] : describeJoinActions(join, dummy_settings))
         map.add(name, value);
 }
 

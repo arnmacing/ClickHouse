@@ -29,8 +29,10 @@
 #include <Interpreters/castColumn.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <ranges>
+#include <string_view>
 
 #include <fmt/ranges.h>
 
@@ -426,7 +428,7 @@ void MergeTreeIndexGranuleVectorSimilarity::deserializeBinary(ReadBuffer & istr,
 {
     LOG_TRACE(logger, "Start loading vector similarity index");
 
-    UInt64 file_version;
+    UInt64 file_version = 0;
     readIntBinary(file_version, istr);
     if (file_version != 1 && file_version != FILE_FORMAT_VERSION)
         throw Exception(
@@ -455,7 +457,7 @@ void MergeTreeIndexGranuleVectorSimilarity::deserializeBinary(ReadBuffer & istr,
             methodToString(persisted_method));
     }
 
-    UInt64 dimensions;
+    UInt64 dimensions = 0;
     readIntBinary(dimensions, istr);
     if (method == VectorSimilarityMethod::HNSW)
     {
@@ -561,8 +563,48 @@ MergeTreeIndexGranulePtr MergeTreeIndexAggregatorVectorSimilarity::getGranuleAnd
 namespace
 {
 
+/// Check a few things to prevent undefined behavior further down in Usearch
+/// - No vector element is +inf, -inf or nan.
+/// - In the case of i8 quantization (which is obscure): additionally, the squared vector magnitude must be non-zero and finite.
+template <typename T>
+void checkVectorIsSane(
+    const T * vector,
+    size_t dimension,
+    unum::usearch::scalar_kind_t scalar_kind,
+    int error_code,
+    std::string_view context)
+{
+    double magnitude_squared = 0.0;
+    for (size_t i = 0; i != dimension; ++i)
+    {
+        T casted = static_cast<T>(vector[i]);
+        if constexpr (std::is_same_v<T, BFloat16>)
+        {
+            if (!casted.isFinite())
+                throw Exception(error_code,
+                    "Vector for vector similarity index ({}) must not contain non-finite values (NaN or Inf)", context);
+        }
+        else
+        {
+            if (!std::isfinite(casted))
+                throw Exception(error_code,
+                    "Vector for vector similarity index ({}) must not contain non-finite values (NaN or Inf)", context);
+        }
+
+        if (scalar_kind == unum::usearch::scalar_kind_t::i8_k)
+        {
+            double v = static_cast<double>(vector[i]);
+            magnitude_squared += v * v;
+        }
+    }
+
+    if (scalar_kind == unum::usearch::scalar_kind_t::i8_k && (magnitude_squared == 0.0 || !std::isfinite(magnitude_squared)))
+        throw Exception(error_code,
+            "Zero-magnitude or non-finite vectors for vector similarity index ({}) are not supported with `i8` quantization", context);
+}
+
 template <typename Column>
-void updateImplHNSW(const ColumnArray * column_array, const ColumnArray::Offsets & column_array_offsets, USearchIndexWithSerializationPtr & hnsw_index, size_t dimensions, size_t rows)
+void updateImplHNSW(const ColumnArray * column_array, const ColumnArray::Offsets & column_array_offsets, USearchIndexWithSerializationPtr & hnsw_index, size_t dimensions, [[maybe_unused]] unum::usearch::scalar_kind_t scalar_kind, size_t rows)
 {
     const auto & column_array_data = column_array->getData();
     const auto & column_array_data_float = typeid_cast<const Column &>(column_array_data);
@@ -597,6 +639,9 @@ void updateImplHNSW(const ColumnArray * column_array, const ColumnArray::Offsets
 
         size_t data_offset = (row == 0 ? 0 : column_array_offsets[row - 1]);
         const typename Column::ValueType & value = column_array_data_float_data[data_offset];
+
+        checkVectorIsSane(&value, dimensions, scalar_kind, ErrorCodes::INCORRECT_DATA, "indexed vector");
+
         unum::usearch::index_dense_t::add_result_t result;
 
         /// Note: add is thread-safe
@@ -737,11 +782,11 @@ void MergeTreeIndexAggregatorVectorSimilarity::update(const Block & block, size_
     if (method == VectorSimilarityMethod::HNSW)
     {
         if (which.isFloat32())
-            updateImplHNSW<ColumnFloat32>(column_array, column_array_offsets, hnsw_index, dimensions, rows);
+            updateImplHNSW<ColumnFloat32>(column_array, column_array_offsets, hnsw_index, dimensions, scalar_kind, rows);
         else if (which.isFloat64())
-            updateImplHNSW<ColumnFloat64>(column_array, column_array_offsets, hnsw_index, dimensions, rows);
+            updateImplHNSW<ColumnFloat64>(column_array, column_array_offsets, hnsw_index, dimensions, scalar_kind, rows);
         else if (which.isBFloat16())
-            updateImplHNSW<ColumnBFloat16>(column_array, column_array_offsets, hnsw_index, dimensions, rows);
+            updateImplHNSW<ColumnBFloat16>(column_array, column_array_offsets, hnsw_index, dimensions, scalar_kind, rows);
         else
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected data type Array(Float*)");
     }
@@ -781,15 +826,16 @@ MergeTreeIndexConditionVectorSimilarity::MergeTreeIndexConditionVectorSimilarity
     , max_limit(context->getSettingsRef()[Setting::max_limit_for_vector_search_queries])
     , is_rescoring(context->getSettingsRef()[Setting::vector_search_with_rescoring])
 {
-    static constexpr auto MAX_INDEX_FETCH_MULTIPLIER = 1000.0;
+    static constexpr auto MIN_INDEX_FETCH_MULTIPLIER = 1.0f;
+    static constexpr auto MAX_INDEX_FETCH_MULTIPLIER = 1000.0f;
 
     if (expansion_search == 0)
         throw Exception(ErrorCodes::INVALID_SETTING_VALUE, "Setting 'hnsw_candidate_list_size_for_search' must not be 0");
 
     if (!std::isfinite(index_fetch_multiplier)
-        || index_fetch_multiplier <= 0.0 || index_fetch_multiplier > MAX_INDEX_FETCH_MULTIPLIER
-        || (parameters && !std::isfinite(index_fetch_multiplier * static_cast<double>(parameters->limit))))
-            throw Exception(ErrorCodes::INVALID_SETTING_VALUE, "Setting 'vector_search_index_fetch_multiplier' must be greater than 0.0 and less than {}", MAX_INDEX_FETCH_MULTIPLIER);
+        || index_fetch_multiplier < MIN_INDEX_FETCH_MULTIPLIER || index_fetch_multiplier > MAX_INDEX_FETCH_MULTIPLIER
+        || (parameters && !std::isfinite(static_cast<double>(index_fetch_multiplier) * static_cast<double>(parameters->limit))))
+            throw Exception(ErrorCodes::INVALID_SETTING_VALUE, "Setting 'vector_search_index_fetch_multiplier' must be greater or equal to {} and less or equal to {}", MIN_INDEX_FETCH_MULTIPLIER, MAX_INDEX_FETCH_MULTIPLIER);
 }
 
 bool MergeTreeIndexConditionVectorSimilarity::mayBeTrueOnGranule(MergeTreeIndexGranulePtr, const UpdatePartialDisjunctionResultFn & /*update_partial_disjunction_result_fn*/) const
@@ -826,11 +872,15 @@ NearestNeighbours MergeTreeIndexConditionVectorSimilarity::calculateApproximateN
     if (granule == nullptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Granule has the wrong type");
 
+    checkVectorIsSane(
+        parameters->reference_vector.data(), parameters->reference_vector.size(),
+        granule->scalar_kind, ErrorCodes::INCORRECT_QUERY, "reference vector in the SELECT query");
+
     size_t limit = parameters->limit;
     if (parameters->additional_filters_present || is_rescoring)
         /// Additional filters mean post-filtering which means that matches may be removed. To compensate, allow to fetch more rows by a factor.
         /// Similarly, if rescoring is on, fetch more neighbours from the index and pass them for the final re-ranking by ORDER BY ... LIMIT.
-        limit = std::min(static_cast<size_t>(static_cast<double>(limit) * index_fetch_multiplier), max_limit);
+        limit = std::min(static_cast<size_t>(static_cast<double>(limit) * static_cast<double>(index_fetch_multiplier)), max_limit);
 
     NearestNeighbours result;
     if (method == VectorSimilarityMethod::HNSW)
@@ -906,13 +956,14 @@ NearestNeighbours MergeTreeIndexConditionVectorSimilarity::calculateApproximateN
 }
 
 MergeTreeIndexVectorSimilarity::MergeTreeIndexVectorSimilarity(
+    StorageMetadataPtr metadata_snapshot_,
     const IndexDescription & index_,
     VectorSimilarityMethod method_,
     UInt64 dimensions_,
     unum::usearch::metric_kind_t metric_kind_,
     unum::usearch::scalar_kind_t scalar_kind_,
     UsearchHnswParams usearch_hnsw_params_)
-    : IMergeTreeIndex(index_)
+    : IMergeTreeIndex(std::move(metadata_snapshot_), index_)
     , method(method_)
     , dimensions(dimensions_)
     , metric_kind(metric_kind_)
@@ -942,7 +993,7 @@ MergeTreeIndexConditionPtr MergeTreeIndexVectorSimilarity::createIndexCondition(
     return std::make_shared<MergeTreeIndexConditionVectorSimilarity>(parameters, index_column, method, metric_kind, context);
 }
 
-MergeTreeIndexPtr vectorSimilarityIndexCreator(const IndexDescription & index)
+MergeTreeIndexPtr vectorSimilarityIndexCreator(StorageMetadataPtr metadata_snapshot, const IndexDescription & index, const MergeTreeSettings & /*settings*/)
 {
     FieldVector args = getFieldsFromIndexArgumentsAST(index.arguments);
     auto method = methodFromString(args[0].safeGet<String>());
@@ -974,10 +1025,10 @@ MergeTreeIndexPtr vectorSimilarityIndexCreator(const IndexDescription & index)
         throw Exception(ErrorCodes::INCORRECT_QUERY, "vector_similarity method '{}' accepts exactly three arguments", methodToString(method));
     }
 
-    return std::make_shared<MergeTreeIndexVectorSimilarity>(index, method, dimensions, metric_kind, scalar_kind, usearch_hnsw_params);
+    return std::make_shared<MergeTreeIndexVectorSimilarity>(std::move(metadata_snapshot), index, method, dimensions, metric_kind, scalar_kind, usearch_hnsw_params);
 }
 
-void vectorSimilarityIndexValidator(const IndexDescription & index, bool /* attach */)
+void vectorSimilarityIndexValidator(const IndexDescription & index, bool /* attach */, const MergeTreeSettings & /*settings*/)
 {
     FieldVector args = getFieldsFromIndexArgumentsAST(index.arguments);
     const bool has_three_args = (args.size() == 3);

@@ -200,6 +200,7 @@ class MergeTreeIndexVectorSimilarity : public IMergeTreeIndex
 {
 public:
     MergeTreeIndexVectorSimilarity(
+        StorageMetadataPtr metadata_snapshot_,
         const IndexDescription & index_,
         VectorSimilarityMethod method_,
         UInt64 dimensions_,
