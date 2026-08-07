@@ -104,7 +104,7 @@ struct MergeTreeIndexGranuleVectorSimilarity final : public IMergeTreeIndexGranu
         USearchIndexWithSerializationPtr hnsw_index_
 #if USE_PDX
         ,
-        std::shared_ptr<PDX::IPDXIndex> pdx_index_
+        std::shared_ptr<PDX::PDXIndexF32> pdx_index_
 #endif
         );
 
@@ -124,7 +124,7 @@ struct MergeTreeIndexGranuleVectorSimilarity final : public IMergeTreeIndexGranu
     const UsearchHnswParams usearch_hnsw_params;
     USearchIndexWithSerializationPtr hnsw_index;
 #if USE_PDX
-    std::shared_ptr<PDX::IPDXIndex> pdx_index;
+    std::shared_ptr<PDX::PDXIndexF32> pdx_index;
 #endif
 
     LoggerPtr logger = getLogger("VectorSimilarityIndex");
@@ -162,7 +162,7 @@ struct MergeTreeIndexAggregatorVectorSimilarity final : IMergeTreeIndexAggregato
 #if USE_PDX
     std::vector<float> pdx_embeddings;
     size_t pdx_rows = 0;
-    std::shared_ptr<PDX::IPDXIndex> pdx_index;
+    std::shared_ptr<PDX::PDXIndexF32> pdx_index;
 #endif
 };
 

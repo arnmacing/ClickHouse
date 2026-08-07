@@ -7,7 +7,6 @@
 #include <Columns/ColumnsNumber.h>
 #include <Common/BitHelpers.h>
 #include <Common/CurrentThread.h>
-#include <Common/filesystemHelpers.h>
 #include <Common/setThreadName.h>
 #include <Common/formatReadable.h>
 #include <Common/getNumberOfCPUCoresToUse.h>
@@ -19,18 +18,14 @@
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeArray.h>
-#include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteBufferFromFile.h>
 #include <IO/WriteHelpers.h>
-#include <IO/copyData.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/castColumn.h>
 
 #include <algorithm>
 #include <cmath>
-#include <filesystem>
 #include <ranges>
 #include <string_view>
 
@@ -44,6 +39,9 @@ namespace ProfileEvents
     extern const Event USearchSearchCount;
     extern const Event USearchSearchVisitedMembers;
     extern const Event USearchSearchComputedDistances;
+    extern const Event PDXSearchCount;
+    extern const Event PDXSearchScannedValues;
+    extern const Event PDXSearchPrunedVectors;
 }
 
 namespace DB
@@ -159,13 +157,13 @@ PDX::DistanceMetric getPdxDistanceMetric(unum::usearch::metric_kind_t metric_kin
     }
 }
 
-std::shared_ptr<PDX::IPDXIndex> createPDXIndex(UInt64 dimensions, unum::usearch::metric_kind_t metric_kind)
+std::shared_ptr<PDX::PDXIndexF32> createPDXIndex(UInt64 dimensions, unum::usearch::metric_kind_t metric_kind)
 {
-    if (dimensions > PDX::PDX_MAX_DIMS)
+    if (dimensions == 0 || dimensions > PDX::PDX_MAX_DIMS)
     {
         throw Exception(
             ErrorCodes::INCORRECT_DATA,
-            "PDX supports dimensions up to {}, got {}",
+            "PDX supports dimensions from 1 up to {}, got {}",
             PDX::PDX_MAX_DIMS,
             dimensions);
     }
@@ -173,43 +171,29 @@ std::shared_ptr<PDX::IPDXIndex> createPDXIndex(UInt64 dimensions, unum::usearch:
     PDX::PDXIndexConfig config;
     config.num_dimensions = static_cast<uint32_t>(dimensions);
     config.distance_metric = getPdxDistanceMetric(metric_kind);
-    config.n_threads = getNumberOfCPUCoresToUse();
 
     return std::make_shared<PDX::PDXIndexF32>(config);
 }
 
-void serializePDXIndex(std::shared_ptr<PDX::IPDXIndex> index, WriteBuffer & ostr)
+void serializePDXIndex(std::shared_ptr<PDX::PDXIndexF32> index, WriteBuffer & ostr)
 {
     if (!index)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Attempt to serialize empty PDX index");
 
-    auto tmp = createTemporaryFile(std::filesystem::temp_directory_path().string());
-    index->Save(tmp->path());
-
-    size_t bytes = std::filesystem::file_size(tmp->path());
-    writeIntBinary(static_cast<UInt64>(bytes), ostr);
-
-    ReadBufferFromFile in(tmp->path());
-    copyData(in, ostr, bytes);
+    index->serialize([&](const char * data, size_t size) { ostr.write(data, size); });
 }
 
-std::shared_ptr<PDX::IPDXIndex> deserializePDXIndex(
+std::shared_ptr<PDX::PDXIndexF32> deserializePDXIndex(
     ReadBuffer & istr,
     UInt64 dimensions,
     unum::usearch::metric_kind_t metric_kind)
 {
-    UInt64 bytes = 0;
-    readIntBinary(bytes, istr);
-    if (bytes == 0)
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Serialized PDX index is empty");
-
-    auto tmp = createTemporaryFile(std::filesystem::temp_directory_path().string());
-    WriteBufferFromFile out(tmp->path());
-    copyData(istr, out, static_cast<size_t>(bytes));
-    out.finalize();
-
     auto index = createPDXIndex(dimensions, metric_kind);
-    index->Restore(tmp->path());
+
+    std::string error;
+    if (!index->deserialize([&](char * data, size_t size) { istr.readStrict(data, size); }, error))
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Vector similarity index could not be loaded: {}. Please drop the index and create it again.", error);
+
     return index;
 }
 #endif
@@ -347,7 +331,7 @@ MergeTreeIndexGranuleVectorSimilarity::MergeTreeIndexGranuleVectorSimilarity(
     USearchIndexWithSerializationPtr hnsw_index_
 #if USE_PDX
     ,
-    std::shared_ptr<PDX::IPDXIndex> pdx_index_
+    std::shared_ptr<PDX::PDXIndexF32> pdx_index_
 #endif
     )
     : index_name(index_name_)
@@ -380,7 +364,7 @@ size_t MergeTreeIndexGranuleVectorSimilarity::memoryUsageBytes() const
         return hnsw_index->memoryUsageBytes();
 
 #if USE_PDX
-    return pdx_index ? pdx_index->GetInMemorySizeInBytes() : 0;
+    return pdx_index ? pdx_index->getInMemorySizeInBytes() : 0;
 #else
     return 0;
 #endif
@@ -408,14 +392,14 @@ void MergeTreeIndexGranuleVectorSimilarity::serializeBinary(WriteBuffer & ostr) 
 #if USE_PDX
     else if (method == VectorSimilarityMethod::PDX)
     {
-        writeIntBinary(static_cast<UInt64>(pdx_index->GetNumDimensions()), ostr);
+        writeIntBinary(static_cast<UInt64>(pdx_index->getNumDimensions()), ostr);
         serializePDXIndex(pdx_index, ostr);
         LOG_TRACE(
             logger,
-            "Wrote vector similarity index (method={}, dimensions={}, clusters={})",
+            "Wrote vector similarity index (method={}, dimensions={}, vectors={})",
             methodToString(method),
-            pdx_index->GetNumDimensions(),
-            pdx_index->GetNumClusters());
+            pdx_index->getNumDimensions(),
+            pdx_index->getNumVectors());
     }
 #endif
     else
@@ -472,10 +456,10 @@ void MergeTreeIndexGranuleVectorSimilarity::deserializeBinary(ReadBuffer & istr,
         pdx_index = deserializePDXIndex(istr, dimensions, metric_kind);
         LOG_TRACE(
             logger,
-            "Loaded vector similarity index (method={}, dimensions={}, clusters={})",
+            "Loaded vector similarity index (method={}, dimensions={}, vectors={})",
             methodToString(method),
-            pdx_index->GetNumDimensions(),
-            pdx_index->GetNumClusters());
+            pdx_index->getNumDimensions(),
+            pdx_index->getNumVectors());
     }
 #endif
     else
@@ -540,7 +524,7 @@ MergeTreeIndexGranulePtr MergeTreeIndexAggregatorVectorSimilarity::getGranuleAnd
     if (!pdx_index && !pdx_embeddings.empty())
     {
         pdx_index = createPDXIndex(dimensions, metric_kind);
-        pdx_index->BuildIndex(pdx_embeddings.data(), pdx_rows);
+        pdx_index->buildIndex(pdx_embeddings.data(), pdx_rows);
     }
 
     auto granule = std::make_shared<MergeTreeIndexGranuleVectorSimilarity>(
@@ -705,6 +689,8 @@ void appendImplPDX(
         size_t end = column_array_offsets[row];
         if (end - begin != dimensions)
             throw Exception(ErrorCodes::INCORRECT_DATA, "All arrays in column with vector similarity index must have equal length");
+
+        checkVectorIsSane(&column_array_data_float_data[begin], dimensions, unum::usearch::scalar_kind_t::f32_k, ErrorCodes::INCORRECT_DATA, "indexed vector");
 
         for (size_t i = begin; i < end; ++i)
             pdx_embeddings.emplace_back(static_cast<float>(column_array_data_float_data[i]));
@@ -923,21 +909,20 @@ NearestNeighbours MergeTreeIndexConditionVectorSimilarity::calculateApproximateN
         if (!granule->pdx_index)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "PDX index is not initialized");
 
-        if (parameters->reference_vector.size() != granule->pdx_index->GetNumDimensions())
+        if (parameters->reference_vector.size() != granule->pdx_index->getNumDimensions())
             throw Exception(ErrorCodes::INCORRECT_QUERY, "The dimension of the reference vector in the query ({}) does not match the dimension in the index ({})",
-                parameters->reference_vector.size(), granule->pdx_index->GetNumDimensions());
+                parameters->reference_vector.size(), granule->pdx_index->getNumDimensions());
 
         std::vector<float> reference_vector(parameters->reference_vector.size());
         for (size_t i = 0; i < parameters->reference_vector.size(); ++i)
             reference_vector[i] = static_cast<float>(parameters->reference_vector[i]);
 
-        size_t nprobe = std::min<size_t>(expansion_search, granule->pdx_index->GetNumClusters());
-        if (nprobe == 0)
-            nprobe = 1;
-        granule->pdx_index->SetNProbe(static_cast<UInt32>(nprobe));
+        PDX::SearchStats search_stats;
+        auto search_result = granule->pdx_index->search(reference_vector.data(), limit, &search_stats);
 
-        auto search_result = granule->pdx_index->Search(reference_vector.data(), limit);
-        std::sort(search_result.begin(), search_result.end(), [](const auto & lhs, const auto & rhs) { return lhs.distance < rhs.distance; });
+        ProfileEvents::increment(ProfileEvents::PDXSearchCount);
+        ProfileEvents::increment(ProfileEvents::PDXSearchScannedValues, search_stats.scanned_values);
+        ProfileEvents::increment(ProfileEvents::PDXSearchPrunedVectors, search_stats.pruned_vectors);
 
         result.rows.reserve(search_result.size());
         if (parameters->return_distances)

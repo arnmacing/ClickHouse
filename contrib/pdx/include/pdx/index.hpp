@@ -1,29 +1,73 @@
 #pragma once
 
+/// A from-scratch implementation of the PDX vector similarity search algorithm:
+///   L. Kuffo, E. Krippner, P. Boncz. "PDX: A Data Layout for Vector Similarity search".
+///   SIGMOD 2025. https://arxiv.org/abs/2503.04422
+///
+/// Implemented here:
+/// - The PDX layout: vectors are stored in blocks of 64, dimension-major within a block,
+///   so that one dimension of all vectors in a block is contiguous in memory.
+/// - PDXearch: distances are accumulated dimension-by-dimension for a whole block in
+///   tight loops over independent accumulators (auto-vectorizable, no horizontal
+///   reduction), with pruning of vectors whose partial distance already exceeds the
+///   current k-th best distance. Dimensions are fetched in exponentially growing steps
+///   (2, 4, 8, ...) and the pruning bound is re-evaluated after each step.
+/// - PDX-BOND dimension ordering: dimension zones are ranked per query by the
+///   distance-to-means criterion, so that the most discriminative dimensions for this
+///   query are scanned first. No preprocessing of the data is required.
+///
+/// The implementation is tailored to ClickHouse vector similarity granules: search is
+/// single-threaded and there is no IVF clustering (a granule holds a bounded number of
+/// vectors, so the whole granule is treated as one collection of blocks).
+///
+/// The pruning is exact for L2: the partial sum of squared differences never decreases,
+/// so it is a valid lower bound of the final distance. Cosine distance is reduced to L2
+/// on the unit sphere: vectors are normalized at build time, the query is normalized at
+/// search time, and cosineDistance = ||q - v||^2 / 2 for unit q, v.
+///
+/// This header deliberately does not throw exceptions. Precondition violations are
+/// programming errors and are guarded by assertions; recoverable errors (corrupt
+/// serialized data) are reported to the caller, which is expected to throw a proper
+/// ClickHouse exception.
+
 #include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
-#include <fstream>
+#include <functional>
 #include <limits>
-#include <memory>
 #include <numeric>
-#include <queue>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace PDX
 {
 
-static constexpr size_t PDX_MAX_DIMS = 16384;
+/// Guards against absurd index definitions; the integration layer validates user input
+/// against this limit before constructing an index.
+inline constexpr size_t PDX_MAX_DIMS = 16384;
 
-enum class DistanceMetric
+/// "Blocks of 64 vectors perform best across all architectures as the SIMD registers
+/// holding the resulting distances are recycled through the entire block processing
+/// without intermediate LOAD/STORE instructions." (PDX paper, Section 6.2)
+inline constexpr size_t BLOCK_SIZE = 64;
+
+/// Granularity of PDX-BOND dimension zones. Zones are consecutive runs of dimensions
+/// which are ranked per query by the distance-to-means criterion; keeping dimensions
+/// within a zone sequential preserves sequential memory access inside a block.
+inline constexpr size_t ZONE_SIZE = 16;
+
+/// First step of the WARMUP phase; subsequent steps double: 2, 4, 8, ... (Section 4)
+inline constexpr size_t FIRST_DIMENSION_STEP = 2;
+
+/// Once at most this many vectors of a block survive, switch from processing all lanes
+/// to processing only the surviving positions (the PRUNE phase of PDXearch).
+inline constexpr size_t SPARSE_SWITCH_THRESHOLD = BLOCK_SIZE / 4;
+
+enum class DistanceMetric : uint8_t
 {
-    L2SQ,
-    COSINE,
-    IP,
+    L2SQ = 0,
+    COSINE = 1,
 };
 
 struct KNNCandidate
@@ -32,445 +76,585 @@ struct KNNCandidate
     float distance;
 };
 
+/// Counters exposed to the integration layer for observability of the pruning.
+struct SearchStats
+{
+    /// Number of (dimension, vector) value visits performed by the distance kernels.
+    /// A full scan without pruning visits num_vectors * num_dimensions values.
+    uint64_t scanned_values = 0;
+    /// Number of vectors discarded by the pruning bound before all their dimensions
+    /// were visited.
+    uint64_t pruned_vectors = 0;
+};
+
 struct PDXIndexConfig
 {
     uint32_t num_dimensions = 0;
     DistanceMetric distance_metric = DistanceMetric::L2SQ;
-    uint32_t seed = 42;
-    uint32_t num_clusters = 0;
-    uint32_t num_meso_clusters = 0;
-    bool normalize = false;
-    float sampling_fraction = 0.0f;
-    uint32_t kmeans_iters = 10;
-    bool hierarchical_indexing = false;
-    uint32_t n_threads = 0;
-
-    void Validate() const
-    {
-        if (num_dimensions == 0 || num_dimensions > PDX_MAX_DIMS)
-        {
-            throw std::invalid_argument(
-                "num_dimensions must be in [1, " + std::to_string(PDX_MAX_DIMS) + "]");
-        }
-    }
-
-    void ValidateNumEmbeddings(size_t num_embeddings_value) const
-    {
-        if (num_embeddings_value > std::numeric_limits<uint32_t>::max())
-            throw std::invalid_argument("num_embeddings must be <= UInt32::max() for MVP PDX index");
-
-        if (num_clusters > 0 && num_clusters > num_embeddings_value)
-        {
-            throw std::invalid_argument(
-                "num_clusters must be <= num_embeddings (got num_clusters=" + std::to_string(num_clusters)
-                    + ", num_embeddings=" + std::to_string(num_embeddings_value) + ")");
-        }
-    }
 };
 
-class IPDXIndex
-{
-public:
-    virtual ~IPDXIndex() = default;
-
-    virtual std::vector<KNNCandidate> Search(const float * query_embedding, size_t knn) const = 0;
-    virtual std::vector<KNNCandidate> FilteredSearch(
-        const float * query_embedding,
-        size_t knn,
-        const std::vector<size_t> & passing_row_ids) const = 0;
-
-    virtual void BuildIndex(const float * embeddings, size_t num_embeddings) = 0;
-    virtual void SetNProbe(uint32_t n_probe) = 0;
-
-    virtual void Save(const std::string & path) = 0;
-    virtual void Restore(const std::string & path) = 0;
-
-    virtual uint32_t GetNumDimensions() const = 0;
-    virtual uint32_t GetNumClusters() const = 0;
-    virtual uint32_t GetClusterSize(uint32_t cluster_id) const = 0;
-    virtual std::vector<uint32_t> GetClusterRowIds(uint32_t cluster_id) const = 0;
-    virtual size_t GetInMemorySizeInBytes() const = 0;
-
-    virtual void Append(size_t /*row_id*/, const float * /*embedding*/)
-    {
-        throw std::runtime_error("Append is not supported by this index type");
-    }
-
-    virtual void Delete(size_t /*row_id*/)
-    {
-        throw std::runtime_error("Delete is not supported by this index type");
-    }
-};
-
-class PDXIndexF32 final : public IPDXIndex
+class PDXIndexF32
 {
 public:
     explicit PDXIndexF32(PDXIndexConfig config_)
-        : config(std::move(config_))
+        : config(config_)
     {
-        config.Validate();
-        if (config.num_clusters == 0)
-            config.num_clusters = 1;
+        assert(config.num_dimensions > 0);
+        assert(config.num_dimensions <= PDX_MAX_DIMS);
     }
 
-    std::vector<KNNCandidate> Search(const float * query_embedding, size_t knn) const override
+    /// Transposes row-major input vectors into the PDX layout and computes the
+    /// per-dimension means used by the PDX-BOND dimension ordering.
+    /// For the cosine metric the vectors are normalized first (see header comment).
+    void buildIndex(const float * embeddings, size_t num_embeddings_)
     {
-        if (!query_embedding)
-            throw std::invalid_argument("query_embedding is null");
-        if (knn == 0 || num_embeddings == 0)
-            return {};
-
-        const size_t effective_knn = std::min(knn, num_embeddings);
-        const float query_sq_norm = computeSquaredNorm(query_embedding);
-
-        using CandidateHeap = std::priority_queue<KNNCandidate, std::vector<KNNCandidate>, FarthestFirst>;
-        CandidateHeap heap;
-
-        for (size_t row = 0; row < num_embeddings; ++row)
-            addCandidate(row, query_embedding, query_sq_norm, effective_knn, heap);
-
-        return drainHeapToSortedResult(heap);
-    }
-
-    std::vector<KNNCandidate> FilteredSearch(
-        const float * query_embedding,
-        size_t knn,
-        const std::vector<size_t> & passing_row_ids) const override
-    {
-        if (!query_embedding)
-            throw std::invalid_argument("query_embedding is null");
-        if (knn == 0 || num_embeddings == 0 || passing_row_ids.empty())
-            return {};
-
-        const size_t effective_knn = std::min(knn, passing_row_ids.size());
-        const float query_sq_norm = computeSquaredNorm(query_embedding);
-
-        using CandidateHeap = std::priority_queue<KNNCandidate, std::vector<KNNCandidate>, FarthestFirst>;
-        CandidateHeap heap;
-
-        for (size_t row : passing_row_ids)
-        {
-            if (row >= num_embeddings)
-                continue;
-            addCandidate(row, query_embedding, query_sq_norm, effective_knn, heap);
-        }
-
-        return drainHeapToSortedResult(heap);
-    }
-
-    void BuildIndex(const float * embeddings, size_t num_embeddings_) override
-    {
-        config.Validate();
-        config.ValidateNumEmbeddings(num_embeddings_);
-
-        if (num_embeddings_ > 0 && !embeddings)
-            throw std::invalid_argument("embeddings is null");
+        assert(num_embeddings_ == 0 || embeddings != nullptr);
+        assert(num_embeddings_ <= std::numeric_limits<uint32_t>::max());
 
         num_embeddings = num_embeddings_;
         const size_t dims = config.num_dimensions;
+        const size_t num_blocks = numBlocks();
 
-        dim_major_embeddings.assign(dims * num_embeddings, 0.0f);
-        squared_norms.assign(num_embeddings, 0.0f);
+        /// Padded lanes of the last block stay zero; they are never reported because
+        /// bookkeeping below only covers real lanes.
+        block_data.assign(num_blocks * dims * BLOCK_SIZE, 0.0f);
+        means.assign(dims, 0.0f);
+        block_means.assign(num_blocks * dims, 0.0f);
 
         if (num_embeddings == 0)
             return;
 
-        const bool normalize_rows = config.normalize && (config.distance_metric == DistanceMetric::COSINE || config.distance_metric == DistanceMetric::IP);
+        std::vector<double> mean_accumulators(dims, 0.0);
+        std::vector<double> block_mean_accumulators(num_blocks * dims, 0.0);
 
         for (size_t row = 0; row < num_embeddings; ++row)
         {
-            float row_sq_norm = 0.0f;
-            const size_t row_offset = row * dims;
+            const float * vector = embeddings + row * dims;
 
-            if (normalize_rows)
+            float norm_inv = 1.0f;
+            if (config.distance_metric == DistanceMetric::COSINE)
             {
+                float sq_norm = 0.0f;
                 for (size_t dim = 0; dim < dims; ++dim)
-                {
-                    const float value = embeddings[row_offset + dim];
-                    row_sq_norm += value * value;
-                }
+                    sq_norm += vector[dim] * vector[dim];
+                const float norm = std::sqrt(sq_norm);
+                if (norm > 0.0f)
+                    norm_inv = 1.0f / norm;
             }
 
-            const float row_norm = std::sqrt(row_sq_norm);
-            const float row_norm_inv = (row_norm > 0.0f ? 1.0f / row_norm : 1.0f);
+            const size_t block = row / BLOCK_SIZE;
+            const size_t lane = row % BLOCK_SIZE;
+            float * block_base = block_data.data() + block * dims * BLOCK_SIZE;
 
-            float stored_sq_norm = 0.0f;
             for (size_t dim = 0; dim < dims; ++dim)
             {
-                float value = embeddings[row_offset + dim];
-                if (normalize_rows)
-                    value *= row_norm_inv;
-
-                dim_major_embeddings[dim * num_embeddings + row] = value;
-                stored_sq_norm += value * value;
+                const float value = vector[dim] * norm_inv;
+                block_base[dim * BLOCK_SIZE + lane] = value;
+                mean_accumulators[dim] += static_cast<double>(value);
+                block_mean_accumulators[block * dims + dim] += static_cast<double>(value);
             }
+        }
 
-            squared_norms[row] = stored_sq_norm;
+        for (size_t dim = 0; dim < dims; ++dim)
+            means[dim] = static_cast<float>(mean_accumulators[dim] / static_cast<double>(num_embeddings));
+
+        for (size_t block = 0; block < num_blocks; ++block)
+        {
+            const double count = static_cast<double>(blockCount(block));
+            for (size_t dim = 0; dim < dims; ++dim)
+                block_means[block * dims + dim] = static_cast<float>(block_mean_accumulators[block * dims + dim] / count);
         }
     }
 
-    void SetNProbe(uint32_t n_probe_) override
+    std::vector<KNNCandidate> search(const float * query, size_t knn, SearchStats * stats = nullptr) const
     {
-        n_probe = std::max<uint32_t>(1, n_probe_);
+        assert(query != nullptr);
+
+        if (knn == 0 || num_embeddings == 0)
+            return {};
+
+        SearchContext context = prepareSearch(query);
+
+        /// Visit blocks in ascending order of the distance from the query to the block
+        /// centroid, so that the k-th best bound tightens as early as possible and the
+        /// remaining blocks prune aggressively. This adapts the paper's IVF strategy of
+        /// processing the most promising clusters first to the flat block collection of
+        /// a granule.
+        for (size_t block : blockVisitOrder(context))
+            searchBlock(block, blockCount(block), /*initial_positions=*/nullptr, knn, context);
+
+        if (stats)
+            *stats = context.stats;
+        return finishSearch(context, knn);
     }
 
-    void Save(const std::string & path) override
+    /// Same search pipeline restricted to the given row ids. All blocks start directly
+    /// in the PRUNE (positions) phase with the passing rows of that block.
+    std::vector<KNNCandidate> filteredSearch(
+        const float * query,
+        size_t knn,
+        const std::vector<size_t> & passing_row_ids,
+        SearchStats * stats = nullptr) const
     {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out)
-            throw std::runtime_error("Cannot open PDX file for writing: " + path);
+        assert(query != nullptr);
 
-        static constexpr uint32_t MAGIC = 0x31584450; // 'PDX1'
-        static constexpr uint32_t VERSION = 1;
+        if (knn == 0 || num_embeddings == 0 || passing_row_ids.empty())
+            return {};
 
-        const uint32_t metric = static_cast<uint32_t>(config.distance_metric);
-        const uint64_t rows = static_cast<uint64_t>(num_embeddings);
-        const uint64_t dim_major_size = static_cast<uint64_t>(dim_major_embeddings.size());
-        const uint64_t norms_size = static_cast<uint64_t>(squared_norms.size());
+        SearchContext context = prepareSearch(query);
 
-        writeBinary(out, MAGIC);
-        writeBinary(out, VERSION);
-        writeBinary(out, config.num_dimensions);
-        writeBinary(out, metric);
-        writeBinary(out, n_probe);
-        writeBinary(out, rows);
-        writeBinary(out, dim_major_size);
-        writeBinary(out, norms_size);
+        /// Group passing rows by block. passing_row_ids is not required to be sorted.
+        std::vector<std::vector<uint32_t>> positions_per_block(numBlocks());
+        for (size_t row : passing_row_ids)
+        {
+            if (row >= num_embeddings)
+                continue;
+            positions_per_block[row / BLOCK_SIZE].push_back(static_cast<uint32_t>(row % BLOCK_SIZE));
+        }
 
-        if (!dim_major_embeddings.empty())
-            out.write(reinterpret_cast<const char *>(dim_major_embeddings.data()), static_cast<std::streamsize>(dim_major_embeddings.size() * sizeof(float)));
-        if (!squared_norms.empty())
-            out.write(reinterpret_cast<const char *>(squared_norms.data()), static_cast<std::streamsize>(squared_norms.size() * sizeof(float)));
+        for (size_t block : blockVisitOrder(context))
+        {
+            if (positions_per_block[block].empty())
+                continue;
+            std::sort(positions_per_block[block].begin(), positions_per_block[block].end());
+            searchBlock(block, blockCount(block), &positions_per_block[block], knn, context);
+        }
 
-        if (!out)
-            throw std::runtime_error("Failed to write PDX file: " + path);
+        if (stats)
+            *stats = context.stats;
+        return finishSearch(context, knn);
     }
 
-    void Restore(const std::string & path) override
+    /// Serializes the index. The writer callback must write exactly `size` bytes.
+    void serialize(const std::function<void(const char *, size_t)> & write) const
     {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-            throw std::runtime_error("Cannot open PDX file for reading: " + path);
+        writeValue(write, SERIALIZATION_MAGIC);
+        writeValue(write, SERIALIZATION_VERSION);
+        writeValue(write, static_cast<uint8_t>(config.distance_metric));
+        writeValue(write, config.num_dimensions);
+        writeValue(write, static_cast<uint64_t>(num_embeddings));
+        write(reinterpret_cast<const char *>(means.data()), means.size() * sizeof(float));
+        write(reinterpret_cast<const char *>(block_means.data()), block_means.size() * sizeof(float));
+        write(reinterpret_cast<const char *>(block_data.data()), block_data.size() * sizeof(float));
+    }
 
-        static constexpr uint32_t MAGIC = 0x31584450; // 'PDX1'
-        static constexpr uint32_t VERSION = 1;
-
+    /// Deserializes an index previously written by serialize. The reader callback must
+    /// read exactly `size` bytes. Returns false and sets `error` on malformed input;
+    /// the caller is expected to throw. The index must have been constructed with the
+    /// same dimensions and metric that were used for serialization.
+    bool deserialize(const std::function<void(char *, size_t)> & read, std::string & error)
+    {
         uint32_t magic = 0;
         uint32_t version = 0;
+        uint8_t metric_raw = 0;
         uint32_t dims = 0;
-        uint32_t metric = 0;
-        uint32_t restored_n_probe = 1;
-        uint64_t rows = 0;
-        uint64_t dim_major_size = 0;
-        uint64_t norms_size = 0;
+        uint64_t count = 0;
 
-        readBinary(in, magic);
-        readBinary(in, version);
-        readBinary(in, dims);
-        readBinary(in, metric);
-        readBinary(in, restored_n_probe);
-        readBinary(in, rows);
-        readBinary(in, dim_major_size);
-        readBinary(in, norms_size);
-
-        if (magic != MAGIC)
-            throw std::runtime_error("Invalid PDX file magic: " + path);
-        if (version != VERSION)
-            throw std::runtime_error("Unsupported PDX file version: " + std::to_string(version));
-        if (dims == 0 || dims > PDX_MAX_DIMS)
-            throw std::runtime_error("Invalid number of dimensions in PDX file: " + std::to_string(dims));
-        if (metric > static_cast<uint32_t>(DistanceMetric::IP))
-            throw std::runtime_error("Invalid distance metric in PDX file: " + std::to_string(metric));
-
-        const uint64_t expected_dim_major_size = rows * static_cast<uint64_t>(dims);
-        if (dim_major_size != expected_dim_major_size)
+        readValue(read, magic);
+        if (magic != SERIALIZATION_MAGIC)
         {
-            throw std::runtime_error(
-                "Invalid PDX payload size: expected " + std::to_string(expected_dim_major_size)
-                + ", got " + std::to_string(dim_major_size));
+            error = "invalid PDX index magic number";
+            return false;
         }
-        if (norms_size != rows)
-            throw std::runtime_error("Invalid PDX norms payload size");
 
-        config.num_dimensions = dims;
-        config.distance_metric = static_cast<DistanceMetric>(metric);
-        config.Validate();
+        readValue(read, version);
+        if (version != SERIALIZATION_VERSION)
+        {
+            error = "unsupported PDX index version " + std::to_string(version);
+            return false;
+        }
 
-        num_embeddings = static_cast<size_t>(rows);
-        n_probe = std::max<uint32_t>(1, restored_n_probe);
+        readValue(read, metric_raw);
+        if (metric_raw != static_cast<uint8_t>(config.distance_metric))
+        {
+            error = "PDX index metric mismatch (expected " + std::to_string(static_cast<uint8_t>(config.distance_metric))
+                + ", got " + std::to_string(metric_raw) + ")";
+            return false;
+        }
 
-        dim_major_embeddings.assign(static_cast<size_t>(dim_major_size), 0.0f);
-        squared_norms.assign(static_cast<size_t>(norms_size), 0.0f);
+        readValue(read, dims);
+        if (dims != config.num_dimensions)
+        {
+            error = "PDX index dimensions mismatch (expected " + std::to_string(config.num_dimensions)
+                + ", got " + std::to_string(dims) + ")";
+            return false;
+        }
 
-        if (!dim_major_embeddings.empty())
-            in.read(reinterpret_cast<char *>(dim_major_embeddings.data()), static_cast<std::streamsize>(dim_major_embeddings.size() * sizeof(float)));
-        if (!squared_norms.empty())
-            in.read(reinterpret_cast<char *>(squared_norms.data()), static_cast<std::streamsize>(squared_norms.size() * sizeof(float)));
+        readValue(read, count);
+        if (count > std::numeric_limits<uint32_t>::max())
+        {
+            error = "invalid number of vectors in PDX index: " + std::to_string(count);
+            return false;
+        }
 
-        if (!in)
-            throw std::runtime_error("Failed to read PDX file: " + path);
+        num_embeddings = count;
+        means.resize(config.num_dimensions);
+        block_means.resize(numBlocks() * config.num_dimensions);
+        block_data.resize(numBlocks() * config.num_dimensions * BLOCK_SIZE);
+        read(reinterpret_cast<char *>(means.data()), means.size() * sizeof(float));
+        read(reinterpret_cast<char *>(block_means.data()), block_means.size() * sizeof(float));
+        read(reinterpret_cast<char *>(block_data.data()), block_data.size() * sizeof(float));
+        return true;
     }
 
-    uint32_t GetNumDimensions() const override
+    uint32_t getNumDimensions() const
     {
         return config.num_dimensions;
     }
 
-    uint32_t GetNumClusters() const override
+    size_t getNumVectors() const
     {
-        /// MVP implementation keeps one cluster and computes distances dimension-by-dimension.
-        return 1;
+        return num_embeddings;
     }
 
-    uint32_t GetClusterSize(uint32_t cluster_id) const override
-    {
-        if (cluster_id != 0)
-            return 0;
-        return static_cast<uint32_t>(num_embeddings);
-    }
-
-    std::vector<uint32_t> GetClusterRowIds(uint32_t cluster_id) const override
-    {
-        if (cluster_id != 0)
-            return {};
-
-        std::vector<uint32_t> result(num_embeddings);
-        std::iota(result.begin(), result.end(), 0);
-        return result;
-    }
-
-    size_t GetInMemorySizeInBytes() const override
+    size_t getInMemorySizeInBytes() const
     {
         return sizeof(*this)
-            + dim_major_embeddings.size() * sizeof(float)
-            + squared_norms.size() * sizeof(float);
+            + block_data.size() * sizeof(float)
+            + means.size() * sizeof(float)
+            + block_means.size() * sizeof(float);
     }
 
 private:
-    struct FarthestFirst
+    static constexpr uint32_t SERIALIZATION_MAGIC = 0x32584450; /// "PDX2"
+    static constexpr uint32_t SERIALIZATION_VERSION = 2;
+
+    struct SearchContext
     {
-        bool operator()(const KNNCandidate & lhs, const KNNCandidate & rhs) const
-        {
-            if (lhs.distance == rhs.distance)
-                return lhs.index < rhs.index;
-            return lhs.distance < rhs.distance;
-        }
+        /// Query, normalized for the cosine metric.
+        std::vector<float> query;
+        /// Dimension visit order: zones ranked by the distance-to-means criterion.
+        std::vector<uint32_t> dim_order;
+        /// Top-k candidates as a binary max-heap over (distance, index).
+        std::vector<KNNCandidate> heap;
+        SearchStats stats;
     };
 
-    template <typename T>
-    static void writeBinary(std::ofstream & out, const T & value)
+    size_t numBlocks() const
     {
-        out.write(reinterpret_cast<const char *>(&value), static_cast<std::streamsize>(sizeof(T)));
+        return (num_embeddings + BLOCK_SIZE - 1) / BLOCK_SIZE;
     }
 
-    template <typename T>
-    static void readBinary(std::ifstream & in, T & value)
+    /// Number of real (non-padding) lanes in a block.
+    size_t blockCount(size_t block) const
     {
-        in.read(reinterpret_cast<char *>(&value), static_cast<std::streamsize>(sizeof(T)));
+        const size_t begin = block * BLOCK_SIZE;
+        return std::min(BLOCK_SIZE, num_embeddings - begin);
     }
 
-    float computeSquaredNorm(const float * vector) const
+    SearchContext prepareSearch(const float * query) const
     {
-        float result = 0.0f;
-        for (size_t dim = 0; dim < config.num_dimensions; ++dim)
-            result += vector[dim] * vector[dim];
-        return result;
-    }
+        const size_t dims = config.num_dimensions;
 
-    float computeDistance(size_t row, const float * query_embedding, float query_sq_norm) const
-    {
-        if (config.distance_metric == DistanceMetric::L2SQ)
+        SearchContext context;
+        context.query.assign(query, query + dims);
+
+        if (config.distance_metric == DistanceMetric::COSINE)
         {
-            float distance = 0.0f;
-            for (size_t dim = 0; dim < config.num_dimensions; ++dim)
+            float sq_norm = 0.0f;
+            for (float value : context.query)
+                sq_norm += value * value;
+            const float norm = std::sqrt(sq_norm);
+            if (norm > 0.0f)
             {
-                const float value = dim_major_embeddings[dim * num_embeddings + row];
-                const float diff = query_embedding[dim] - value;
-                distance += diff * diff;
+                const float norm_inv = 1.0f / norm;
+                for (float & value : context.query)
+                    value *= norm_inv;
             }
-            return distance;
         }
 
-        float dot = 0.0f;
-        for (size_t dim = 0; dim < config.num_dimensions; ++dim)
-            dot += query_embedding[dim] * dim_major_embeddings[dim * num_embeddings + row];
+        /// PDX-BOND: rank dimension zones by how far the query is from the per-dimension
+        /// means; the farther the query value, the faster that dimension accumulates
+        /// distance and the earlier vectors can be pruned. (Section 5 of the paper)
+        const size_t num_zones = (dims + ZONE_SIZE - 1) / ZONE_SIZE;
+        std::vector<float> zone_scores(num_zones, 0.0f);
+        for (size_t dim = 0; dim < dims; ++dim)
+            zone_scores[dim / ZONE_SIZE] += std::fabs(context.query[dim] - means[dim]);
 
-        if (config.distance_metric == DistanceMetric::IP)
-            return -dot;
+        std::vector<uint32_t> zone_order(num_zones);
+        std::iota(zone_order.begin(), zone_order.end(), 0);
+        std::sort(zone_order.begin(), zone_order.end(), [&](uint32_t lhs, uint32_t rhs)
+        {
+            if (zone_scores[lhs] == zone_scores[rhs])
+                return lhs < rhs;
+            return zone_scores[lhs] > zone_scores[rhs];
+        });
 
-        const float embedding_sq_norm = squared_norms[row];
-        const float denominator = std::sqrt(query_sq_norm * embedding_sq_norm);
-        if (denominator <= std::numeric_limits<float>::epsilon())
-            return 1.0f;
-        return 1.0f - (dot / denominator);
+        context.dim_order.reserve(dims);
+        for (uint32_t zone : zone_order)
+        {
+            const size_t zone_begin = static_cast<size_t>(zone) * ZONE_SIZE;
+            const size_t zone_end = std::min(zone_begin + ZONE_SIZE, dims);
+            for (size_t dim = zone_begin; dim < zone_end; ++dim)
+                context.dim_order.push_back(static_cast<uint32_t>(dim));
+        }
+
+        return context;
     }
 
-    template <typename CandidateHeap>
-    void addCandidate(
-        size_t row,
-        const float * query_embedding,
-        float query_sq_norm,
-        size_t knn,
-        CandidateHeap & heap) const
+    /// Blocks sorted by ascending distance from the query to the block centroid.
+    std::vector<size_t> blockVisitOrder(const SearchContext & context) const
     {
-        const float distance = computeDistance(row, query_embedding, query_sq_norm);
-        KNNCandidate candidate{static_cast<uint32_t>(row), distance};
+        const size_t dims = config.num_dimensions;
+        const size_t num_blocks = numBlocks();
 
-        if (heap.size() < knn)
+        std::vector<float> block_scores(num_blocks, 0.0f);
+        for (size_t block = 0; block < num_blocks; ++block)
         {
-            heap.push(candidate);
+            const float * centroid = block_means.data() + block * dims;
+            float score = 0.0f;
+            for (size_t dim = 0; dim < dims; ++dim)
+            {
+                const float diff = context.query[dim] - centroid[dim];
+                score += diff * diff;
+            }
+            block_scores[block] = score;
+        }
+
+        std::vector<size_t> order(num_blocks);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs)
+        {
+            if (block_scores[lhs] == block_scores[rhs])
+                return lhs < rhs;
+            return block_scores[lhs] < block_scores[rhs];
+        });
+        return order;
+    }
+
+    /// The pruning bound: the distance of the current k-th best candidate, or infinity
+    /// while fewer than k candidates have been collected (the START phase: the first
+    /// block is effectively a linear scan because nothing can be pruned yet).
+    static float currentThreshold(const SearchContext & context, size_t knn)
+    {
+        if (context.heap.size() < knn)
+            return std::numeric_limits<float>::infinity();
+        return context.heap.front().distance;
+    }
+
+    static bool heapOrder(const KNNCandidate & lhs, const KNNCandidate & rhs)
+    {
+        if (lhs.distance == rhs.distance)
+            return lhs.index < rhs.index;
+        return lhs.distance < rhs.distance;
+    }
+
+    static void tryAddCandidate(SearchContext & context, size_t knn, uint32_t row, float distance)
+    {
+        auto worse = [](const KNNCandidate & lhs, const KNNCandidate & rhs) { return heapOrder(lhs, rhs); };
+
+        KNNCandidate candidate{row, distance};
+        if (context.heap.size() < knn)
+        {
+            context.heap.push_back(candidate);
+            std::push_heap(context.heap.begin(), context.heap.end(), worse);
             return;
         }
 
-        const auto & top = heap.top();
-        if (candidate.distance < top.distance || (candidate.distance == top.distance && candidate.index < top.index))
+        if (heapOrder(candidate, context.heap.front()))
         {
-            heap.pop();
-            heap.push(candidate);
+            std::pop_heap(context.heap.begin(), context.heap.end(), worse);
+            context.heap.back() = candidate;
+            std::push_heap(context.heap.begin(), context.heap.end(), worse);
         }
     }
 
-    template <typename CandidateHeap>
-    static std::vector<KNNCandidate> drainHeapToSortedResult(CandidateHeap & heap)
+    /// PDXearch over one block. `initial_positions == nullptr` starts in the dense
+    /// (WARMUP) phase over all lanes; otherwise the block starts directly in the
+    /// sparse (PRUNE) phase restricted to the given lanes.
+    void searchBlock(
+        size_t block,
+        size_t block_count,
+        const std::vector<uint32_t> * initial_positions,
+        size_t knn,
+        SearchContext & context) const
     {
-        std::vector<KNNCandidate> result;
-        result.reserve(heap.size());
+        const size_t dims = config.num_dimensions;
+        const float * block_base = block_data.data() + block * dims * BLOCK_SIZE;
+        const uint32_t row_base = static_cast<uint32_t>(block * BLOCK_SIZE);
 
-        while (!heap.empty())
+        alignas(64) float accumulators[BLOCK_SIZE] = {};
+
+        /// Survivor positions live on the stack; a block never has more than
+        /// BLOCK_SIZE lanes, so no allocation is needed on this hot path.
+        uint32_t positions[BLOCK_SIZE];
+        size_t positions_count = 0;
+        bool sparse = false;
+        if (initial_positions)
         {
-            result.push_back(heap.top());
-            heap.pop();
+            for (uint32_t lane : *initial_positions)
+                positions[positions_count++] = lane;
+            sparse = true;
         }
 
-        std::sort(result.begin(), result.end(), [](const KNNCandidate & lhs, const KNNCandidate & rhs)
+        const size_t initial_count = sparse ? positions_count : block_count;
+
+        size_t processed_dims = 0;
+        size_t step = FIRST_DIMENSION_STEP;
+
+        while (processed_dims < dims)
         {
-            if (lhs.distance == rhs.distance)
-                return lhs.index < rhs.index;
-            return lhs.distance < rhs.distance;
-        });
+            const size_t chunk_end = std::min(processed_dims + step, dims);
+
+            if (!sparse)
+            {
+                /// WARMUP: process all lanes of the block. The inner loop runs over
+                /// contiguous memory with BLOCK_SIZE independent accumulators and no
+                /// horizontal reduction, which makes it auto-vectorizable. Pruned lanes
+                /// are recomputed too - that waste is what the positions phase below
+                /// eliminates once few enough lanes survive.
+                for (size_t i = processed_dims; i < chunk_end; ++i)
+                {
+                    const size_t dim = context.dim_order[i];
+                    const float query_value = context.query[dim];
+                    const float * values = block_base + dim * BLOCK_SIZE;
+                    for (size_t lane = 0; lane < BLOCK_SIZE; ++lane)
+                    {
+                        const float diff = query_value - values[lane];
+                        accumulators[lane] += diff * diff;
+                    }
+                }
+                context.stats.scanned_values += (chunk_end - processed_dims) * block_count;
+            }
+            else
+            {
+                /// PRUNE: "we break off distance computations by skipping the already
+                /// discarded vectors" - only surviving positions are visited.
+                for (size_t i = processed_dims; i < chunk_end; ++i)
+                {
+                    const size_t dim = context.dim_order[i];
+                    const float query_value = context.query[dim];
+                    const float * values = block_base + dim * BLOCK_SIZE;
+                    for (size_t position = 0; position < positions_count; ++position)
+                    {
+                        const uint32_t lane = positions[position];
+                        const float diff = query_value - values[lane];
+                        accumulators[lane] += diff * diff;
+                    }
+                }
+                context.stats.scanned_values += (chunk_end - processed_dims) * positions_count;
+            }
+
+            processed_dims = chunk_end;
+            step *= 2;
+
+            if (processed_dims >= dims)
+                break;
+
+            /// Re-evaluate the pruning bound after each step. The partial L2 sum is a
+            /// monotone lower bound of the final distance, so anything above the
+            /// current k-th best distance can never enter the result (Section 2.3).
+            const float threshold = currentThreshold(context, knn);
+            if (std::isinf(threshold))
+                continue;
+
+            if (!sparse)
+            {
+                size_t survivors = 0;
+                for (size_t lane = 0; lane < block_count; ++lane)
+                    if (accumulators[lane] <= threshold)
+                        ++survivors;
+
+                if (survivors == 0)
+                    break;
+
+                if (survivors <= SPARSE_SWITCH_THRESHOLD)
+                {
+                    /// "maintaining the count of the remaining vectors and their
+                    /// positions within the block. Then, the following distance
+                    /// calculations are performed using this positions array." (Section 4)
+                    for (size_t lane = 0; lane < block_count; ++lane)
+                        if (accumulators[lane] <= threshold)
+                            positions[positions_count++] = static_cast<uint32_t>(lane);
+                    sparse = true;
+                }
+            }
+            else
+            {
+                size_t write_index = 0;
+                for (size_t position = 0; position < positions_count; ++position)
+                {
+                    const uint32_t lane = positions[position];
+                    if (accumulators[lane] <= threshold)
+                        positions[write_index++] = lane;
+                }
+                positions_count = write_index;
+
+                if (positions_count == 0)
+                    break;
+            }
+        }
+
+        /// Report survivors that were scanned to the end; their partial sums are now
+        /// complete distances.
+        size_t survivors = 0;
+        if (processed_dims >= dims)
+        {
+            const float threshold = currentThreshold(context, knn);
+            if (sparse)
+            {
+                for (size_t position = 0; position < positions_count; ++position)
+                {
+                    const uint32_t lane = positions[position];
+                    if (accumulators[lane] <= threshold || context.heap.size() < knn)
+                        tryAddCandidate(context, knn, row_base + lane, accumulators[lane]);
+                }
+                survivors = positions_count;
+            }
+            else
+            {
+                for (size_t lane = 0; lane < block_count; ++lane)
+                {
+                    if (accumulators[lane] <= threshold || context.heap.size() < knn)
+                        tryAddCandidate(context, knn, row_base + static_cast<uint32_t>(lane), accumulators[lane]);
+                }
+                survivors = block_count;
+            }
+        }
+
+        context.stats.pruned_vectors += initial_count - std::min(survivors, initial_count);
+    }
+
+    std::vector<KNNCandidate> finishSearch(SearchContext & context, size_t knn) const
+    {
+        std::vector<KNNCandidate> result = std::move(context.heap);
+        std::sort(result.begin(), result.end(), heapOrder);
+        if (result.size() > knn)
+            result.resize(knn);
+
+        /// Cosine distance was searched as L2 on the unit sphere:
+        /// ||q - v||^2 = 2 - 2 * (q . v), hence cosineDistance = 1 - (q . v) = L2^2 / 2.
+        if (config.distance_metric == DistanceMetric::COSINE)
+        {
+            for (KNNCandidate & candidate : result)
+                candidate.distance /= 2.0f;
+        }
 
         return result;
     }
 
+    template <typename T>
+    static void writeValue(const std::function<void(const char *, size_t)> & write, const T & value)
+    {
+        write(reinterpret_cast<const char *>(&value), sizeof(T));
+    }
+
+    template <typename T>
+    static void readValue(const std::function<void(char *, size_t)> & read, T & value)
+    {
+        read(reinterpret_cast<char *>(&value), sizeof(T));
+    }
+
     PDXIndexConfig config;
-    uint32_t n_probe = 1;
     size_t num_embeddings = 0;
-    std::vector<float> dim_major_embeddings;
-    std::vector<float> squared_norms;
+    /// PDX layout: value of dimension `d` of vector `row` lives at
+    /// block_data[(block * num_dimensions + d) * BLOCK_SIZE + lane], where
+    /// block = row / BLOCK_SIZE and lane = row % BLOCK_SIZE. Padding lanes are zero.
+    std::vector<float> block_data;
+    /// Per-dimension means of the stored (possibly normalized) values, for PDX-BOND.
+    std::vector<float> means;
+    /// Per-block per-dimension means (block centroids), for the block visit order.
+    std::vector<float> block_means;
 };
-
-/// The current ClickHouse integration uses only the f32 implementation.
-using PDXIndexU8 = PDXIndexF32;
-using PDXTreeIndexF32 = PDXIndexF32;
-using PDXTreeIndexU8 = PDXIndexF32;
-
-inline std::unique_ptr<IPDXIndex> LoadPDXIndex(const std::string & path)
-{
-    PDXIndexConfig config;
-    config.num_dimensions = 1;
-    auto index = std::make_unique<PDXIndexF32>(config);
-    index->Restore(path);
-    return index;
-}
 
 }

@@ -656,6 +656,9 @@ The server successfully detected this situation and will download merged part fr
     M(USearchSearchCount, "Number of search operations performed in usearch indexes.", ValueType::Number) \
     M(USearchSearchVisitedMembers, "Number of nodes visited when searching in usearch indexes.", ValueType::Number) \
     M(USearchSearchComputedDistances, "Number of times distance was computed when searching usearch indexes.", ValueType::Number) \
+    M(PDXSearchCount, "Number of search operations performed in PDX vector similarity indexes.", ValueType::Number) \
+    M(PDXSearchScannedValues, "Number of (vector, dimension) values visited when searching PDX vector similarity indexes. Without pruning, a search visits rows * dimensions values; smaller relative numbers mean the pruning is effective.", ValueType::Number) \
+    M(PDXSearchPrunedVectors, "Number of vectors discarded by partial-distance pruning before all their dimensions were visited when searching PDX vector similarity indexes.", ValueType::Number) \
     \
     M(RWLockAcquiredReadLocks, "Number of times a read lock was acquired (in a heavy RWLock).", ValueType::Number) \
     M(RWLockAcquiredWriteLocks, "Number of times a write lock was acquired (in a heavy RWLock).", ValueType::Number) \
