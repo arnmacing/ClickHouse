@@ -6,9 +6,11 @@ title: 'Vector search PDX integration'
 doc_type: 'guide'
 ---
 
-This document describes how `vector_similarity` works in MergeTree and where the `pdx` method is integrated.
+This document describes how `vector_similarity` works in MergeTree and how the `pdx` method is integrated.
 
-## Execution Path {#execution-path}
+The `pdx` method implements the PDX algorithm from the paper: L. Kuffo, E. Krippner, P. Boncz. "PDX: A Data Layout for Vector Similarity Search", SIGMOD 2025 ([arXiv:2503.04422](https://arxiv.org/abs/2503.04422)). It is an implementation of the published algorithm written for ClickHouse, not a vendored third-party library.
+
+## Execution path {#execution-path}
 
 1. DDL validation is handled by `vectorSimilarityIndexValidator` in `MergeTreeIndexVectorSimilarity.cpp`.
 2. Skip-index build runs through:
@@ -22,12 +24,12 @@ This document describes how `vector_similarity` works in MergeTree and where the
    - Result row offsets are converted to mark ranges and injected into vector-search hints.
 5. During row-level read, `MergeTreeRangeReader::fillDistanceColumnAndFilterForVectorSearch` computes `_distance` and final filtering/reranking behavior.
 
-## Method Dispatch (`hnsw` / `pdx`) {#method-dispatch-hnsw-pdx}
+## Method dispatch (`hnsw` / `pdx`) {#method-dispatch-hnsw-pdx}
 
-`MergeTreeIndexVectorSimilarity` now stores `VectorSimilarityMethod` and dispatches all lifecycle operations by method:
+`MergeTreeIndexVectorSimilarity` stores `VectorSimilarityMethod` and dispatches all lifecycle operations by method:
 
 - `hnsw`: existing USearch path.
-- `pdx`: PDX path using `PDXIndexF32` from `contrib/pdx`.
+- `pdx`: PDX path using `PDX::PDXIndexF32` from `contrib/pdx`.
 
 Dispatch points:
 
@@ -37,36 +39,51 @@ Dispatch points:
 - `MergeTreeIndexAggregatorVectorSimilarity::update`
 - `MergeTreeIndexConditionVectorSimilarity::calculateApproximateNearestNeighbors`
 
-## Storage Format and Compatibility {#storage-format-and-compatibility}
+## The PDX algorithm {#the-pdx-algorithm}
 
-`MergeTreeIndexGranuleVectorSimilarity` persistence format is versioned at ClickHouse level.
+The implementation lives in `contrib/pdx/include/pdx/index.hpp` (header-only, no dependencies) and consists of three components from the paper:
+
+**PDX layout.** Vectors are stored in blocks of 64, dimension-major within a block: the value of dimension `d` of lane `l` in block `b` lives at `block_data[(b * D + d) * 64 + l]`. One dimension of all 64 vectors of a block is contiguous in memory, which makes the per-dimension distance kernel a tight loop over 64 independent accumulators that the compiler auto-vectorizes (no horizontal reduction).
+
+**PDXearch.** Search proceeds block by block, and within a block dimension-group by dimension-group with exponentially growing steps (2, 4, 8, ... dimensions). After each step, the partial distances are compared with the current k-th best distance. For L2 the partial sum of squared differences is a monotone lower bound of the final distance, so any vector whose partial distance exceeds the bound is discarded exactly, never heuristically. Once few enough vectors of a block survive, the search switches to a compacted positions array and visits only the survivors (the PRUNE phase). Blocks are visited in ascending distance from the query to the per-block centroid, so that the pruning bound tightens as early as possible; this adapts the paper's IVF cluster ordering to the flat collection of vectors in one granule.
+
+**PDX-BOND dimension ordering.** Dimensions are grouped into zones of 16 consecutive dimensions; per query, zones are ranked by the distance-to-means criterion (how far the query value is from the per-dimension mean of the stored data). The most discriminative dimensions for this query are scanned first, so pruning fires earlier. No preprocessing of the data is required.
+
+**Metrics.** `L2Distance` is searched natively. `cosineDistance` is reduced to exact L2 search on the unit sphere: vectors are normalized at build time, the query is normalized at search time, and `cosineDistance = L2^2 / 2` on normalized vectors. `dotProduct` is not supported by the `pdx` method.
+
+## Storage format and compatibility {#storage-format-and-compatibility}
+
+`MergeTreeIndexGranuleVectorSimilarity` persistence is versioned at the ClickHouse level.
 
 - Version `1`: legacy format (HNSW-only payload).
-- Version `2`: adds explicit method tag (`hnsw`/`pdx`) and keeps dimensions header.
+- Version `2`: adds an explicit method tag (`hnsw`/`pdx`) after the version, followed by the dimensions header and the method payload.
+
+The PDX payload contains a magic number, a payload version, the metric, the dimensions, the number of vectors, the per-dimension means (for PDX-BOND), the per-block centroids (for the block visit order) and the block data. Serialization goes directly through `WriteBuffer`/`ReadBuffer`, so PDX indexes work on all disk types, including remote and encrypted disks.
 
 Compatibility rules:
 
 - Existing HNSW parts written with version `1` are still readable.
 - New parts are written with version `2`.
-- Method mismatch between index metadata and persisted payload fails with a clear error and requires index rebuild.
+- Method mismatch between index metadata and persisted payload fails with a clear error and requires an index rebuild.
 
-## PDX Build and Search in Granules {#pdx-build-and-search-in-granules}
+## Observability {#observability}
 
-- Build phase (`update`): vectors are collected row-major in `float` buffer.
-- Finalization (`getGranuleAndReset`): `PDXIndexF32` is built per granule.
-- Search phase (`calculateApproximateNearestNeighbors`):
-  - `hnsw_candidate_list_size_for_search` is mapped to PDX `nprobe` (clamped to cluster count).
-  - `vector_search_index_fetch_multiplier` and `max_limit_for_vector_search_queries` are reused exactly as for HNSW.
-  - Distances/row ids are returned in the same `NearestNeighbours` structure.
+Three `ProfileEvents` expose the effectiveness of the pruning:
 
-## PDX Integration Constraints {#pdx-integration-constraints}
+- `PDXSearchCount`: number of searches in PDX indexes.
+- `PDXSearchScannedValues`: number of (vector, dimension) values visited. A search without pruning visits `rows * dimensions` values; the ratio of this counter to that product is the scanned fraction.
+- `PDXSearchPrunedVectors`: number of vectors discarded by the pruning bound before all their dimensions were visited.
 
-- `pdx` is available only when `USE_PDX=1`.
+## PDX integration constraints {#pdx-integration-constraints}
+
+- `pdx` is available only when `USE_PDX=1` (CMake option `ENABLE_PDX`, on by default with `ENABLE_LIBRARIES`).
 - If ClickHouse is built without PDX support, DDL with `vector_similarity('pdx', ...)` fails with `PDX support is not compiled`.
-- MVP scope keeps existing vector-search planner/runtime behavior intact (including current part-level filtering limitations).
+- `pdx` accepts exactly three index arguments: `('pdx', <distance_function>, <dimensions>)`. There are no quantization or HNSW-specific parameters, and the setting `hnsw_candidate_list_size_for_search` does not affect PDX searches.
+- Supported distance functions: `L2Distance`, `cosineDistance`.
 
-## Source Layout {#source-layout}
+## Source layout {#source-layout}
 
+- Algorithm implementation: `contrib/pdx/include/pdx/index.hpp`
 - Integration logic: `src/Storages/MergeTree/MergeTreeIndexVectorSimilarity.{h,cpp}`
 - Build wiring:
   - `contrib/pdx-cmake/CMakeLists.txt`
@@ -74,5 +91,4 @@ Compatibility rules:
   - `src/configure_config.cmake`
   - `src/Common/config.h.in`
   - `src/CMakeLists.txt`
-- MVP PDX implementation: `contrib/pdx/include/pdx/index.hpp` (minimal header-only prototype).
-- Upstream reference for the initial baseline: `contrib/pdx/UPSTREAM_COMMIT`.
+- Tests: `tests/queries/0_stateless/02354_vector_search_pdx_smoke.sh` (smoke + exactness against a full scan), `tests/performance/vector_search_pdx.xml`

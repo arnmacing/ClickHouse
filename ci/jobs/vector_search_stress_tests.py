@@ -53,6 +53,7 @@ OTHER_SETTINGS = "other_settings"
 LIMIT_N = "limit"
 TRUTH_SET_FILES = "truth_set_files"
 TRUTH_SET_QUERY_SOURCE = "truth_set_query_source"
+INDEX_TYPE = "index_type"  # 'hnsw' (default) or 'pdx'
 QUANTIZATION = "quantization"
 HNSW_M = "hnsw_M"
 HNSW_EF_CONSTRUCTION = "hnsw_ef_construction"
@@ -388,7 +389,12 @@ class RunTest:
         hnsw_M = self._test_params[HNSW_M]
         hnsw_ef_C = self._test_params[HNSW_EF_CONSTRUCTION]
 
-        add_index = f"ALTER TABLE {self._table} ADD INDEX vector_index {self._vector_column} TYPE vector_similarity('hnsw','{self._distance_metric}', {self._dimension}, {quantization}, {hnsw_M}, {hnsw_ef_C})"
+        index_type = self._test_params.get(INDEX_TYPE, "hnsw")
+        if index_type == "pdx":
+            # PDX accepts no quantization/HNSW parameters
+            add_index = f"ALTER TABLE {self._table} ADD INDEX vector_index {self._vector_column} TYPE vector_similarity('pdx','{self._distance_metric}', {self._dimension})"
+        else:
+            add_index = f"ALTER TABLE {self._table} ADD INDEX vector_index {self._vector_column} TYPE vector_similarity('hnsw','{self._distance_metric}', {self._dimension}, {quantization}, {hnsw_M}, {hnsw_ef_C})"
         self._chclient.query(add_index)
 
         logger("Materialzing the index")
